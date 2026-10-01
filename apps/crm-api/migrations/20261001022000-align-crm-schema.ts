@@ -36,8 +36,8 @@ export const up: MigrationFn<QueryInterface> = async ({ context: qi }) => {
         ELSE LOWER(REPLACE(name, ' ', '_'))
       END,
       stage = CASE
-        WHEN is_terminal = 1 AND LOWER(name) = 'closed' THEN 'WON'
-        WHEN is_terminal = 1 THEN 'LOST'
+        WHEN LOWER(name) = 'closed' THEN 'WON'
+        WHEN LOWER(name) = 'withdrawn' THEN 'LOST'
         ELSE 'OPEN'
       END
     WHERE \`key\` IS NULL OR stage IS NULL

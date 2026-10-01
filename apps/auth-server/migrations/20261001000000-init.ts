@@ -167,13 +167,13 @@ export async function up({ context: qi }: Ctx): Promise<void> {
       },
 
       /*
-       * Existing tenants.id is a signed INT.
+       * Existing tenants.id is an UNSIGNED INT.
        *
-       * Therefore this MUST be INTEGER, not INTEGER.UNSIGNED,
+       * Therefore this MUST be INTEGER.UNSIGNED,
        * otherwise MySQL rejects the foreign key.
        */
       tenantId: {
-        type: DataTypes.INTEGER,
+        type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
         references: {
           model: 'tenants',
