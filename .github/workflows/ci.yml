@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, typecheck, tests (real MySQL + Redis)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 --silent"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=3s --health-retries=20
+    env:
+      TEST_AUTH_DATABASE_URL: mysql://root@127.0.0.1:3306/auth_test
+      TEST_CRM_DATABASE_URL: mysql://root@127.0.0.1:3306/crm_test
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Create test databases
+        run: mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE auth_test; CREATE DATABASE crm_test;"
+      - run: npm run build -w @propflow/shared
+      - name: Typecheck (strict)
+        run: npm run typecheck
+      - name: Formatting
+        run: npm run format:check
+      - name: OpenAPI is generated and valid
+        run: |
+          npm run swagger:build
+          git diff --exit-code -- swagger.json apps/*/swagger.json
+          npx --yes @redocly/cli@1 lint swagger.json apps/auth-server/swagger.json apps/crm-api/swagger.json --skip-rule=operation-4xx-response
+      - name: Tests
+        run: |
+          npm test -w @propflow/auth-server
+          npm test -w @propflow/crm-api
+
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Docker images (build + size budget)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        run: |
+          docker build -f apps/auth-server/Dockerfile -t propflow/auth-server:ci .
+          docker build -f apps/crm-api/Dockerfile -t propflow/crm-api:ci .
+      - name: Images must be < 250 MB and run as non-root
+        run: |
+          for img in propflow/auth-server:ci propflow/crm-api:ci; do
+            size=$(docker image inspect "$img" --format '{{.Size}}')
+            user=$(docker image inspect "$img" --format '{{.Config.User}}')
+            echo "$img: $((size/1024/1024)) MB, user=$user"
+            test "$size" -lt 262144000
+            test "$user" = "node"
+          done

@@ -1,0 +1,30 @@
+{
+  "name": "propflow",
+  "private": true,
+  "version": "1.0.0",
+  "description": "PropFlow — multi-tenant real-estate CRM (auth-server + crm-api + shared)",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w @propflow/shared && npm run build -w @propflow/auth-server && npm run build -w @propflow/crm-api",
+    "keys:generate": "npm run --silent keys:generate -w @propflow/auth-server",
+    "migrate": "npm run migrate -w @propflow/auth-server && npm run migrate -w @propflow/crm-api",
+    "seed": "npm run seed -w @propflow/auth-server && npm run seed -w @propflow/crm-api",
+    "dev:auth": "npm run dev -w @propflow/auth-server",
+    "dev:crm": "npm run dev -w @propflow/crm-api",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run build -w @propflow/shared && npm test -w @propflow/auth-server && npm test -w @propflow/crm-api",
+    "swagger:build": "node scripts/build-swagger.mjs",
+    "format": "prettier --write \"{apps,packages}/**/src/**/*.ts\" \"apps/*/{tests,migrations,seeders}/**/*.ts\" \"scripts/*.mjs\"",
+    "format:check": "prettier --check \"{apps,packages}/**/src/**/*.ts\" \"apps/*/{tests,migrations,seeders}/**/*.ts\" \"scripts/*.mjs\""
+  },
+  "devDependencies": {
+    "prettier": "^3.9.9"
+  }
+}

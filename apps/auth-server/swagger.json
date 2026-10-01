@@ -1,0 +1,2923 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "PropFlow auth-server",
+    "version": "1.0.0",
+    "contact": {
+      "name": "PropFlow",
+      "email": "bionex.product@gmail.com"
+    },
+    "license": {
+      "name": "Proprietary — hiring assignment",
+      "url": "https://github.com/your-github/propflow"
+    },
+    "description": "Identity service for PropFlow. The **only** holder of private keys.\n\n* **Access tokens:** RS256 JWT, 60 s in the deployed build, header `kid`, claims `sub, tid, role, name, jti, iat, exp`.\n* **Refresh tokens:** opaque 256-bit, rotating, 7 days, httpOnly cookie `pf_rt`, stored hashed (SHA-256) in Redis and grouped by family; replaying a used token revokes the whole family.\n* **JWKS:** `/.well-known/jwks.json` — at least two keys live across a rotation; crm-api verifies with it.\n* **Login lockout:** 5 failures per IP + email → 15 min, 429 + `Retry-After`.\n\n### Roles (enforced by one `authorize({ roles })` middleware + a `propertyScope()` helper)\n\n| Role | Scope |\n|---|---|\n| SUPER_ADMIN | Platform console only: tenants, counts, signing keys, security events. Never tenant data (403). |\n| ADMIN | Everything in own tenant: users, invites, master data, all properties, export, dashboard. |\n| MANAGER | All properties of the tenant, reassign, bulk, export, dashboard, team calendar. |\n| AGENT | Only listings assigned to them. Others' ids → **404**. No export / bulk / dashboard / admin (403). |\n\nEach operation lists its allowed roles in `x-roles`.\n\n### Status codes\n`400` validation · `401` missing/expired token · `403` wrong role · `404` not found **or not yours** · `409` version conflict / duplicate · `422` business rule · `429` rate limit · `503` dependency down.\n\n### Error shape (everywhere)\n```json\n{ \"error\": { \"code\": \"VERSION_CONFLICT\", \"message\": \"…\", \"details\": { } } }\n```"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4000",
+      "description": "Local (npm run dev:auth / docker compose)"
+    },
+    {
+      "url": "https://propflow-auth.up.railway.app",
+      "description": "Railway (replace with your deployed URL)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Auth",
+      "description": "Login, refresh rotation, logout, tenant sign-up"
+    },
+    {
+      "name": "Invites",
+      "description": "Signed single-use invite links (24 h)"
+    },
+    {
+      "name": "Users",
+      "description": "Tenant user administration (ADMIN)"
+    },
+    {
+      "name": "Platform",
+      "description": "SUPER_ADMIN console: tenants, keys, security events"
+    },
+    {
+      "name": "System",
+      "description": "Health and JWKS"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Liveness + MySQL + Redis",
+        "description": "Public. 200 when MySQL, Redis and at least one signing key are available, otherwise 503. Used by the Docker HEALTHCHECK and Railway.",
+        "operationId": "authHealth",
+        "responses": {
+          "200": {
+            "description": "Healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthHealth"
+                },
+                "example": {
+                  "status": "ok",
+                  "service": "auth-server",
+                  "version": "1.0.0",
+                  "uptimeSeconds": 5231,
+                  "checks": {
+                    "mysql": {
+                      "status": "up",
+                      "latencyMs": 3
+                    },
+                    "redis": {
+                      "status": "up",
+                      "latencyMs": 1
+                    },
+                    "signingKeys": {
+                      "status": "up",
+                      "published": 2
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "description": "A dependency is down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthHealth"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/.well-known/jwks.json": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Public signing keys (JWKS)",
+        "description": "Every key that can still verify a live token: the current signing key plus retired keys during their grace period (so crm-api keeps accepting tokens across a rotation without a restart). `Cache-Control: public, max-age=300`. crm-api caches it in Redis (`jwks`, 10 min) and refetches on an unknown `kid`.",
+        "operationId": "jwks",
+        "responses": {
+          "200": {
+            "description": "JWK Set",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              },
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "example": "public, max-age=300, stale-while-revalidate=60"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Jwks"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/register-tenant": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Public sign-up: create a tenant and its first ADMIN",
+        "description": "Tenant + ADMIN user are created in one DB transaction, then the admin is logged in (same response as `/auth/login`). crm-api receives a `tenant.created` event and provisions the default status pipeline, property types and amenities.",
+        "operationId": "registerTenant",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterTenantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Tenant created, admin logged in",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              },
+              "Set-Cookie": {
+                "description": "Rotating refresh token: `pf_rt=<opaque>; Path=/auth; HttpOnly; Secure; SameSite=None; Max-Age=604800`",
+                "schema": {
+                  "type": "string",
+                  "example": "pf_rt=q4x…; Path=/auth; Expires=Thu, 08 Oct 2026 04:31:10 GMT; HttpOnly; Secure; SameSite=None"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "Slug or email already taken",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "slug": {
+                    "value": {
+                      "error": {
+                        "code": "SLUG_TAKEN",
+                        "message": "This slug is already taken",
+                        "details": {
+                          "fields": {
+                            "slug": "This slug is already taken"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "email": {
+                    "value": {
+                      "error": {
+                        "code": "EMAIL_TAKEN",
+                        "message": "An account with this email already exists",
+                        "details": {
+                          "fields": {
+                            "email": "An account with this email already exists"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/slug-available": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Check whether a tenant slug is free (inline form validation)",
+        "operationId": "slugAvailable",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "slug",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 60
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Availability",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "slug": {
+                      "type": "string"
+                    },
+                    "available": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "example": {
+                  "slug": "skyline",
+                  "available": false
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        },
+        "security": []
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Log in with email + password",
+        "description": "Returns the access token in the body and sets the refresh token as an httpOnly cookie. Rate limited per IP + email in Redis (`rl:login:{ip}:{email}`): after 5 failures the pair is locked for 15 minutes and every attempt (even with the right password) gets 429 with `Retry-After`. Each failure reports `details.remainingAttempts`.",
+        "operationId": "login",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Logged in",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              },
+              "Set-Cookie": {
+                "description": "Rotating refresh token: `pf_rt=<opaque>; Path=/auth; HttpOnly; Secure; SameSite=None; Max-Age=604800`",
+                "schema": {
+                  "type": "string",
+                  "example": "pf_rt=q4x…; Path=/auth; Expires=Thu, 08 Oct 2026 04:31:10 GMT; HttpOnly; Secure; SameSite=None"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "description": "Wrong email or password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INVALID_CREDENTIALS",
+                    "message": "Email or password is incorrect",
+                    "details": {
+                      "remainingAttempts": 3,
+                      "fields": {
+                        "password": "Email or password is incorrect (3 attempts left)"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "description": "Account or tenant deactivated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "ACCOUNT_DISABLED",
+                    "message": "This account has been deactivated"
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Rotate the refresh token and get a new access token",
+        "description": "Reads `pf_rt` from the cookie. The token is consumed atomically (Redis Lua script) and a new one in the **same family** is set.\n\n**Reuse detection:** presenting a token that was already used means it leaked. The whole family is deleted — including the newest, legitimate token — a CRITICAL `REFRESH_REUSE_DETECTED` security event is written, and 401 `REFRESH_REUSED` is returned.\n\nThe web client serialises refreshes (one shared promise), so 5 parallel 401s cause exactly one call here. If the request carries an `Origin` header it must be the web origin (CSRF guard for the SameSite=None cookie).",
+        "operationId": "refresh",
+        "security": [
+          {
+            "refreshCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "New access token; rotated cookie set",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              },
+              "Set-Cookie": {
+                "description": "Rotating refresh token: `pf_rt=<opaque>; Path=/auth; HttpOnly; Secure; SameSite=None; Max-Age=604800`",
+                "schema": {
+                  "type": "string",
+                  "example": "pf_rt=q4x…; Path=/auth; Expires=Thu, 08 Oct 2026 04:31:10 GMT; HttpOnly; Secure; SameSite=None"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown, expired or reused refresh token (cookie is cleared)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "invalid": {
+                    "value": {
+                      "error": {
+                        "code": "REFRESH_INVALID",
+                        "message": "Refresh token is invalid or expired"
+                      }
+                    }
+                  },
+                  "reused": {
+                    "value": {
+                      "error": {
+                        "code": "REFRESH_REUSED",
+                        "message": "Refresh token reuse detected. All sessions in this family were revoked."
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "description": "Foreign Origin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "FORBIDDEN_ORIGIN",
+                    "message": "Origin not allowed"
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Log out this device (revoke this session's family)",
+        "description": "Idempotent. After this, a stolen refresh token from the same session is useless (401 on /auth/refresh). The cookie is cleared.",
+        "operationId": "logout",
+        "security": [
+          {
+            "refreshCookie": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Logged out",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "description": "Foreign Origin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/logout-all": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Log out every session of the current user",
+        "operationId": "logoutAll",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sessions revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revokedSessions": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "example": {
+                  "revokedSessions": 3
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Current user profile",
+        "operationId": "me",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/PublicUser"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/invite": {
+      "post": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "Invite a user into the tenant (ADMIN)",
+        "description": "Creates a signed, single-use invite link valid for 24 h. No email is sent: the link is returned and logged. A newer invite for the same email revokes older pending ones. Alias of `POST /invites`.",
+        "operationId": "createInvite",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Invite created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "A user with this email exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "EMAIL_TAKEN",
+                    "message": "A user with this email already exists",
+                    "details": {
+                      "fields": {
+                        "email": "A user with this email already exists"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/auth/invite-info": {
+      "get": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "Inspect an invite link before accepting it",
+        "operationId": "inviteInfo",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invite details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteInfo"
+                },
+                "example": {
+                  "email": "rahul@skyline.dev",
+                  "name": "Rahul Verma",
+                  "role": "AGENT",
+                  "tenant": {
+                    "id": 1,
+                    "name": "Skyline Realty",
+                    "slug": "skyline"
+                  },
+                  "expiresAt": "2026-10-02T04:31:10.000Z"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid, expired, revoked or already used",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INVITE_INVALID",
+                    "message": "Invite link has already been accepted"
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/auth/accept-invite": {
+      "post": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "Accept an invite: create the account and log in",
+        "description": "Single use: the invite row is locked `FOR UPDATE` and `accepted_at` set in the same transaction that creates the user.",
+        "operationId": "acceptInvite",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptInviteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Account created, logged in",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              },
+              "Set-Cookie": {
+                "description": "Rotating refresh token: `pf_rt=<opaque>; Path=/auth; HttpOnly; Secure; SameSite=None; Max-Age=604800`",
+                "schema": {
+                  "type": "string",
+                  "example": "pf_rt=q4x…; Path=/auth; Expires=Thu, 08 Oct 2026 04:31:10 GMT; HttpOnly; Secure; SameSite=None"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "Email taken meanwhile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid / expired / used invite",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INVITE_INVALID",
+                    "message": "Invite link has expired"
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/users": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List users of the tenant (ADMIN)",
+        "operationId": "listUsers",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/TenantRole"
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "description": "Matches name or email"
+          },
+          {
+            "name": "includeInactive",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Users",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PublicUser"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "User id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Get one user of the tenant (ADMIN)",
+        "operationId": "getUser",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "User",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicUser"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Change role, rename, deactivate / reactivate (ADMIN)",
+        "description": "The last active ADMIN of a tenant can be neither demoted nor deactivated (422 `LAST_ADMIN`; admin rows are locked FOR UPDATE so concurrent demotions cannot both pass). Deactivation or a role change revokes the user’s refresh tokens immediately.",
+        "operationId": "updateUser",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUserRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicUser"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "description": "Last admin guard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "LAST_ADMIN",
+                    "message": "The last active admin cannot be demoted or deactivated",
+                    "details": {
+                      "fields": {
+                        "role": "At least one active admin is required"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/invites": {
+      "get": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "List invites of the tenant, newest first (ADMIN)",
+        "operationId": "listInvites",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Invites",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Invite"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "Create an invite (ADMIN) — same as POST /auth/invite",
+        "operationId": "createInvite2",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Invite created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Email taken",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/invites/{id}/link": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Invite id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "Re-issue the signed link of a pending invite (\"Copy link\")",
+        "operationId": "inviteLink",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Link",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "description": "Invite not pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/invites/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Invite id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "delete": {
+        "tags": [
+          "Invites"
+        ],
+        "summary": "Revoke a pending invite (ADMIN)",
+        "operationId": "revokeInvite",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked invite",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Invite"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/platform/tenants": {
+      "get": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Tenants console: every tenant with user counts (SUPER_ADMIN)",
+        "description": "Counts only. Property counts come from crm-api `GET /platform/tenant-stats`; the platform console never sees property details, owner phones or chats.",
+        "operationId": "listTenants",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Tenants",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TenantSummary"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Create a tenant and invite its first ADMIN (SUPER_ADMIN)",
+        "description": "One transaction: tenant row + ADMIN invite. Returns the invite link for the new admin.",
+        "operationId": "createTenant",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTenantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Tenant created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTenantResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Slug or email taken (inline error on the drawer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SLUG_TAKEN",
+                    "message": "This slug is already taken",
+                    "details": {
+                      "fields": {
+                        "slug": "This slug is already taken"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/platform/tenants/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Tenant id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "patch": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Suspend / reactivate a tenant (SUPER_ADMIN)",
+        "description": "Suspending revokes every refresh token of the tenant’s users; logins then fail with 403 ACCOUNT_DISABLED.",
+        "operationId": "setTenantActive",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "isActive": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "isActive"
+                ]
+              },
+              "example": {
+                "isActive": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "slug": {
+                      "type": "string"
+                    },
+                    "isActive": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/platform/security-events": {
+      "get": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Security events feed (SUPER_ADMIN)",
+        "operationId": "securityEvents",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "example": "REFRESH_REUSE_DETECTED"
+          },
+          {
+            "name": "tenantId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "beforeId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Keyset pagination cursor"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Events, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SecurityEvent"
+                      }
+                    },
+                    "nextBeforeId": {
+                      "type": "integer",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/admin/keys": {
+      "get": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Signing keys and their state (SUPER_ADMIN)",
+        "operationId": "listKeys",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SigningKeyInfo"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/admin/rotate-keys": {
+      "post": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Rotate the signing key pair (SUPER_ADMIN)",
+        "description": "Generates a new RSA-2048 pair; new tokens are signed with it immediately. Previous keys are retired but stay in JWKS for `RETIRED_KEY_GRACE_SECONDS`, so access tokens (and invite links) they signed keep verifying — crm-api picks the new `kid` up on first sight without a restart. The new private key is stored AES-256-GCM encrypted with `KEY_ENCRYPTION_KEY` so all auth-server instances can sign with it.",
+        "operationId": "rotateKeys",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "responses": {
+          "201": {
+            "description": "Rotated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "kid": {
+                      "type": "string"
+                    },
+                    "retired": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "keys": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SigningKeyInfo"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT (RS256)",
+        "description": "Access token from `/auth/login`, `/auth/refresh`, `/auth/register-tenant` or `/auth/accept-invite`. RS256, header carries `kid`; claims `sub`, `tid`, `role`, `name`, `jti`, `iat`, `exp`, `iss=propflow-auth`, `aud=propflow`. 60 s lifetime in the deployed build. Keep it in memory only."
+      },
+      "refreshCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "pf_rt",
+        "description": "Opaque 256-bit rotating refresh token (7 days). httpOnly; Secure; SameSite=None (web and API are on different sites); Path=/auth. Stored in Redis only as SHA-256. Never sent in a JSON body."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "The one error shape returned by both services for every non-2xx response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "VALIDATION_ERROR",
+                  "UNAUTHENTICATED",
+                  "TOKEN_EXPIRED",
+                  "INVALID_TOKEN",
+                  "INVALID_CREDENTIALS",
+                  "REFRESH_INVALID",
+                  "REFRESH_REUSED",
+                  "FORBIDDEN_ROLE",
+                  "FORBIDDEN_ORIGIN",
+                  "NOT_FOUND",
+                  "VERSION_CONFLICT",
+                  "DUPLICATE_LISTING",
+                  "CONFLICT",
+                  "EMAIL_TAKEN",
+                  "SLUG_TAKEN",
+                  "BUSINESS_RULE",
+                  "LAST_ADMIN",
+                  "IN_USE",
+                  "TERMINAL_STATUS",
+                  "INVITE_INVALID",
+                  "ACCOUNT_DISABLED",
+                  "RATE_LIMITED",
+                  "INTERNAL",
+                  "SERVICE_UNAVAILABLE"
+                ],
+                "description": "Stable machine-readable code"
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable message (safe to show in the UI)"
+              },
+              "details": {
+                "description": "Optional, code-specific. For VALIDATION_ERROR it is `ValidationErrorDetails`; for VERSION_CONFLICT it carries the current server copy.",
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ValidationErrorDetails"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        }
+      },
+      "ValidationErrorDetails": {
+        "type": "object",
+        "properties": {
+          "fields": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Field path → first error message. The web app maps these onto react-hook-form inputs.",
+            "example": {
+              "priceInr": "Price must be greater than 0",
+              "ownerPhone": "Enter a valid 10-digit Indian mobile number"
+            }
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "fields"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "SUPER_ADMIN",
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ]
+      },
+      "TenantRole": {
+        "type": "string",
+        "enum": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ]
+      },
+      "HealthCheck": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down"
+            ]
+          },
+          "latencyMs": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "PublicUser": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 3
+          },
+          "tenantId": {
+            "type": "integer",
+            "example": 1,
+            "description": "null for SUPER_ADMIN",
+            "nullable": true
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "lastLoginAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "email",
+          "name",
+          "role",
+          "isActive"
+        ],
+        "example": {
+          "id": 3,
+          "tenantId": 1,
+          "email": "manager@skyline.dev",
+          "name": "Neha Kapoor",
+          "role": "MANAGER",
+          "isActive": true,
+          "lastLoginAt": "2026-10-01T04:31:10.000Z",
+          "createdAt": "2026-09-01T10:00:00.000Z"
+        }
+      },
+      "TenantRef": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ]
+      },
+      "SessionResponse": {
+        "type": "object",
+        "properties": {
+          "accessToken": {
+            "type": "string",
+            "description": "RS256 JWT, 60 s"
+          },
+          "tokenType": {
+            "type": "string",
+            "enum": [
+              "Bearer"
+            ]
+          },
+          "expiresIn": {
+            "type": "integer",
+            "description": "Seconds",
+            "example": 60
+          },
+          "user": {
+            "$ref": "#/components/schemas/PublicUser"
+          },
+          "tenant": {
+            "type": "object",
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TenantRef"
+              }
+            ]
+          }
+        },
+        "required": [
+          "accessToken",
+          "tokenType",
+          "expiresIn",
+          "user",
+          "tenant"
+        ],
+        "example": {
+          "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IkRBMHBXc0xTM1lJc294UUtUUkRpR09NSkNLVDZMSnEtIn0.eyJ0aWQiOjEsInJvbGUiOiJNQU5BR0VSIi4uLn0.sig",
+          "tokenType": "Bearer",
+          "expiresIn": 60,
+          "user": {
+            "id": 3,
+            "tenantId": 1,
+            "email": "manager@skyline.dev",
+            "name": "Neha Kapoor",
+            "role": "MANAGER",
+            "isActive": true,
+            "lastLoginAt": "2026-10-01T04:31:10.000Z",
+            "createdAt": "2026-09-01T10:00:00.000Z"
+          },
+          "tenant": {
+            "id": 1,
+            "name": "Skyline Realty",
+            "slug": "skyline"
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 190
+          },
+          "password": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "example": {
+          "email": "manager@skyline.dev",
+          "password": "PropFlow@123"
+        }
+      },
+      "RegisterTenantRequest": {
+        "type": "object",
+        "properties": {
+          "companyName": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "slug": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 60,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "adminName": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "adminEmail": {
+            "type": "string",
+            "format": "email"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128,
+            "description": "At least 8 chars with a letter and a digit"
+          }
+        },
+        "required": [
+          "companyName",
+          "slug",
+          "adminName",
+          "adminEmail",
+          "password"
+        ],
+        "example": {
+          "companyName": "Coastline Properties",
+          "slug": "coastline",
+          "adminName": "Anita Desai",
+          "adminEmail": "anita@coastline.in",
+          "password": "Coastline2026"
+        }
+      },
+      "InviteRequest": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          }
+        },
+        "required": [
+          "email",
+          "name",
+          "role"
+        ],
+        "example": {
+          "email": "rahul@skyline.dev",
+          "name": "Rahul Verma",
+          "role": "AGENT"
+        }
+      },
+      "Invite": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "tenantId": {
+            "type": "integer"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "invitedBy": {
+            "type": "integer",
+            "nullable": true
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "acceptedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "revokedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "ACCEPTED",
+              "REVOKED",
+              "EXPIRED"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "InviteResponse": {
+        "type": "object",
+        "properties": {
+          "invite": {
+            "$ref": "#/components/schemas/Invite"
+          },
+          "inviteUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "Signed, single-use, 24 h. Also written to the logs (no real email is sent)."
+          },
+          "inviteToken": {
+            "type": "string",
+            "description": "RS256 JWT (typ=invite, aud=propflow:invite, jti=invite id)"
+          }
+        },
+        "required": [
+          "invite",
+          "inviteUrl",
+          "inviteToken"
+        ],
+        "example": {
+          "invite": {
+            "id": 12,
+            "tenantId": 1,
+            "email": "rahul@skyline.dev",
+            "name": "Rahul Verma",
+            "role": "AGENT",
+            "invitedBy": 2,
+            "expiresAt": "2026-10-02T04:31:10.000Z",
+            "acceptedAt": null,
+            "revokedAt": null,
+            "state": "PENDING",
+            "createdAt": "2026-10-01T04:31:10.000Z"
+          },
+          "inviteUrl": "https://propflow-yourname.web.app/accept-invite?token=eyJhbGciOiJSUzI1NiIs…",
+          "inviteToken": "eyJhbGciOiJSUzI1NiIs…"
+        }
+      },
+      "InviteInfo": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "tenant": {
+            "type": "object",
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TenantRef"
+              }
+            ]
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AcceptInviteRequest": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "minLength": 20,
+            "description": "The `token` query parameter of the invite link"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120,
+            "description": "Overrides the name the admin typed"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "token",
+          "password"
+        ],
+        "example": {
+          "token": "eyJhbGciOiJSUzI1NiIs…",
+          "password": "Welcome2026"
+        }
+      },
+      "UpdateUserRequest": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          }
+        },
+        "minProperties": 1,
+        "example": {
+          "role": "MANAGER"
+        }
+      },
+      "TenantSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "userCount": {
+            "type": "integer"
+          },
+          "activeUserCount": {
+            "type": "integer"
+          },
+          "usersByRole": {
+            "type": "object",
+            "properties": {
+              "ADMIN": {
+                "type": "integer"
+              },
+              "MANAGER": {
+                "type": "integer"
+              },
+              "AGENT": {
+                "type": "integer"
+              }
+            }
+          },
+          "pendingInvites": {
+            "type": "integer"
+          }
+        },
+        "example": {
+          "id": 1,
+          "name": "Skyline Realty",
+          "slug": "skyline",
+          "isActive": true,
+          "createdAt": "2026-09-01T10:00:00.000Z",
+          "userCount": 4,
+          "activeUserCount": 4,
+          "usersByRole": {
+            "ADMIN": 1,
+            "MANAGER": 1,
+            "AGENT": 2
+          },
+          "pendingInvites": 0
+        }
+      },
+      "CreateTenantRequest": {
+        "type": "object",
+        "properties": {
+          "companyName": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "slug": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "minLength": 3,
+            "maxLength": 60
+          },
+          "adminName": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "adminEmail": {
+            "type": "string",
+            "format": "email"
+          }
+        },
+        "required": [
+          "companyName",
+          "slug",
+          "adminName",
+          "adminEmail"
+        ],
+        "example": {
+          "companyName": "Metro Nest",
+          "slug": "metro-nest",
+          "adminName": "Kiran Rao",
+          "adminEmail": "kiran@metronest.in"
+        }
+      },
+      "CreateTenantResponse": {
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "tenant": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "slug": {
+                    "type": "string"
+                  },
+                  "isActive": {
+                    "type": "boolean"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/InviteResponse"
+          }
+        ]
+      },
+      "SecurityEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "LOGIN_SUCCESS",
+              "LOGIN_FAILED",
+              "LOGIN_LOCKED",
+              "REFRESH_REUSE_DETECTED",
+              "LOGOUT",
+              "LOGOUT_ALL",
+              "KEY_ROTATED",
+              "TENANT_CREATED",
+              "INVITE_CREATED",
+              "INVITE_ACCEPTED",
+              "USER_UPDATED"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "INFO",
+              "WARN",
+              "CRITICAL"
+            ]
+          },
+          "userId": {
+            "type": "integer",
+            "nullable": true
+          },
+          "tenantId": {
+            "type": "integer",
+            "nullable": true
+          },
+          "ip": {
+            "type": "string",
+            "nullable": true
+          },
+          "userAgent": {
+            "type": "string",
+            "nullable": true
+          },
+          "requestId": {
+            "type": "string",
+            "nullable": true
+          },
+          "meta": {
+            "type": "object",
+            "additionalProperties": true,
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "id": 88,
+          "type": "REFRESH_REUSE_DETECTED",
+          "severity": "CRITICAL",
+          "userId": 3,
+          "tenantId": 1,
+          "ip": "49.36.10.4",
+          "userAgent": "Mozilla/5.0",
+          "requestId": "1d0f…",
+          "meta": {
+            "familyId": "6b1c…",
+            "revokedTokens": 2
+          },
+          "createdAt": "2026-10-01T05:02:44.000Z"
+        }
+      },
+      "SigningKeyInfo": {
+        "type": "object",
+        "properties": {
+          "kid": {
+            "type": "string",
+            "description": "RFC 7638 thumbprint (truncated)"
+          },
+          "alg": {
+            "type": "string",
+            "enum": [
+              "RS256"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "env",
+              "rotated"
+            ],
+            "description": "`env` = bootstrap key from JWT_PRIVATE_KEY; `rotated` = created by /admin/rotate-keys and stored AES-256-GCM encrypted"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "retiredAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "signing": {
+            "type": "boolean",
+            "description": "true for the key currently signing new tokens"
+          },
+          "publishedUntil": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Retired keys stay in JWKS until their tokens (and invite links) have expired",
+            "nullable": true
+          }
+        }
+      },
+      "Jwk": {
+        "type": "object",
+        "properties": {
+          "kty": {
+            "type": "string",
+            "enum": [
+              "RSA"
+            ]
+          },
+          "kid": {
+            "type": "string"
+          },
+          "alg": {
+            "type": "string",
+            "enum": [
+              "RS256"
+            ]
+          },
+          "use": {
+            "type": "string",
+            "enum": [
+              "sig"
+            ]
+          },
+          "n": {
+            "type": "string"
+          },
+          "e": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kty",
+          "kid",
+          "alg",
+          "use",
+          "n",
+          "e"
+        ]
+      },
+      "Jwks": {
+        "type": "object",
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Jwk"
+            }
+          }
+        },
+        "required": [
+          "keys"
+        ],
+        "example": {
+          "keys": [
+            {
+              "kty": "RSA",
+              "kid": "q2V0dGhpc2lzYW5ld2tleWlkMDAwMDE",
+              "alg": "RS256",
+              "use": "sig",
+              "n": "0SceKp6N1YXu…",
+              "e": "AQAB"
+            },
+            {
+              "kty": "RSA",
+              "kid": "DA0pWsLS3YIsoxQKTRDiGOMJCKT6LJq-",
+              "alg": "RS256",
+              "use": "sig",
+              "n": "u8x0…",
+              "e": "AQAB"
+            }
+          ]
+        }
+      },
+      "AuthHealth": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "service": {
+            "type": "string",
+            "example": "auth-server"
+          },
+          "version": {
+            "type": "string"
+          },
+          "uptimeSeconds": {
+            "type": "integer"
+          },
+          "checks": {
+            "type": "object",
+            "properties": {
+              "mysql": {
+                "$ref": "#/components/schemas/HealthCheck"
+              },
+              "redis": {
+                "$ref": "#/components/schemas/HealthCheck"
+              },
+              "signingKeys": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "up",
+                      "down"
+                    ]
+                  },
+                  "published": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "400 — request failed validation against the shared Zod schema",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "details": {
+                  "fields": {
+                    "email": "Invalid email"
+                  },
+                  "issues": [
+                    {
+                      "path": "email",
+                      "code": "invalid_string",
+                      "message": "Invalid email"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "401 — missing, invalid or expired access token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "missing": {
+                "value": {
+                  "error": {
+                    "code": "UNAUTHENTICATED",
+                    "message": "Authentication required"
+                  }
+                }
+              },
+              "expired": {
+                "summary": "Access token expired → client calls /auth/refresh and retries",
+                "value": {
+                  "error": {
+                    "code": "TOKEN_EXPIRED",
+                    "message": "Access token expired"
+                  }
+                }
+              },
+              "invalid": {
+                "value": {
+                  "error": {
+                    "code": "INVALID_TOKEN",
+                    "message": "Invalid access token"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "403 — authenticated, but the role may not do this",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "FORBIDDEN_ROLE",
+                "message": "Your role does not allow this action"
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "404 — does not exist, belongs to another tenant, or (for an AGENT) is not assigned to you. These cases are deliberately indistinguishable.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "NOT_FOUND",
+                "message": "Property not found"
+              }
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "422 — a business rule was violated",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "BUSINESS_RULE",
+                "message": "Some listings were not found; nothing was changed",
+                "details": {
+                  "missingIds": [
+                    999999
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "429 — rate limited",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds until the lockout ends",
+            "schema": {
+              "type": "integer",
+              "example": 897
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many failed attempts. Try again in 15 min.",
+                "details": {
+                  "retryAfter": 897
+                }
+              }
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "503 — a dependency is down",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Identity service is unavailable"
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "XRequestId": {
+        "name": "X-Request-Id",
+        "in": "header",
+        "required": false,
+        "description": "Optional correlation id (8–64 chars `[A-Za-z0-9._:-]`). Generated when absent and echoed back in the response header; appears on every log line.",
+        "schema": {
+          "type": "string",
+          "example": "web-7f3a9c21"
+        }
+      }
+    },
+    "headers": {
+      "X-Request-Id": {
+        "description": "Correlation id for this request (search logs with it)",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    }
+  }
+}

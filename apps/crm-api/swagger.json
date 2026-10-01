@@ -1,0 +1,5527 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "PropFlow crm-api",
+    "version": "1.0.0",
+    "contact": {
+      "name": "PropFlow",
+      "email": "bionex.product@gmail.com"
+    },
+    "license": {
+      "name": "Proprietary — hiring assignment",
+      "url": "https://github.com/your-github/propflow"
+    },
+    "description": "Properties, site visits, chat, master data, dashboard and export.\n\nEvery request runs through: **requestId + logger → authenticate (RS256 via JWKS) → tenantScope (`req.tenantId = token.tid`, never from body/query) → authorize (role) → validate (shared Zod) → controller → service → error handler**.\n\n### Roles (enforced by one `authorize({ roles })` middleware + a `propertyScope()` helper)\n\n| Role | Scope |\n|---|---|\n| SUPER_ADMIN | Platform console only: tenants, counts, signing keys, security events. Never tenant data (403). |\n| ADMIN | Everything in own tenant: users, invites, master data, all properties, export, dashboard. |\n| MANAGER | All properties of the tenant, reassign, bulk, export, dashboard, team calendar. |\n| AGENT | Only listings assigned to them. Others' ids → **404**. No export / bulk / dashboard / admin (403). |\n\nEach operation lists its allowed roles in `x-roles`.\n\n### Status codes\n`400` validation · `401` missing/expired token · `403` wrong role · `404` not found **or not yours** · `409` version conflict / duplicate · `422` business rule · `429` rate limit · `503` dependency down.\n\n### Error shape (everywhere)\n```json\n{ \"error\": { \"code\": \"VERSION_CONFLICT\", \"message\": \"…\", \"details\": { } } }\n```\n\n### Real-time (Socket.IO)\n\nConnect to the crm-api origin with `io(CRM_URL, { auth: { token } })`. Invalid or expired token → `connect_error`.\n\n| Event | Direction | Payload | Rule |\n|---|---|---|---|\n| `auth:renew` | client → server | `{ token }` | Re-auth on expiry without reconnecting |\n| `property:join` | client → server | `{ propertyId }` | Joins `property:{id}` only if the user may read it (else ack `NOT_FOUND`) |\n| `chat:send` | client → server | `{ propertyId, clientMsgId, body }` | Ack `{ ok, id, createdAt, duplicate }`; persisted before broadcast; retries idempotent |\n| `typing` | both | `{ propertyId, isTyping }` | Relayed to the room |\n| `chat:new` / `note:new` / `presence` | server → room | message / note / users | < 1 s |\n| `property:updated` | server → staff + assignee | `{ ids, action, version }` | Open tables refresh the row |\n| `masterdata:updated` | server → tenant | `{ kind }` | Refetch master data |\n| `visit:reminder` | server → user | visit summary | From cron, 15 min before, once |\n\nFull machine-readable contract: the `x-socket-io` extension of this document."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4001",
+      "description": "Local (npm run dev:crm / docker compose; via nginx on :8080)"
+    },
+    {
+      "url": "https://propflow-crm.up.railway.app",
+      "description": "Railway (replace with your deployed URL)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Properties",
+      "description": "Listings: list/filter/sort, CRUD with optimistic locking, bulk, export"
+    },
+    {
+      "name": "Notes & chat",
+      "description": "Notes and chat history (live events over Socket.IO)"
+    },
+    {
+      "name": "Site visits",
+      "description": "Calendar; stored in UTC"
+    },
+    {
+      "name": "Dashboard",
+      "description": "Analytics (ADMIN, MANAGER)"
+    },
+    {
+      "name": "Master data",
+      "description": "Statuses, property types, localities, amenities"
+    },
+    {
+      "name": "Users",
+      "description": "Team directory; /users and /invites forwarded to auth-server"
+    },
+    {
+      "name": "Platform",
+      "description": "SUPER_ADMIN counts"
+    },
+    {
+      "name": "System",
+      "description": "Health"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "MySQL, Redis and JWKS status",
+        "operationId": "crmHealth",
+        "responses": {
+          "200": {
+            "description": "Healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CrmHealth"
+                },
+                "example": {
+                  "status": "ok",
+                  "service": "crm-api",
+                  "instance": "crm-api-1",
+                  "version": "1.0.0",
+                  "uptimeSeconds": 812,
+                  "checks": {
+                    "mysql": {
+                      "status": "up",
+                      "latencyMs": 2
+                    },
+                    "redis": {
+                      "status": "up",
+                      "latencyMs": 1
+                    },
+                    "jwks": {
+                      "status": "up",
+                      "kids": [
+                        "DA0pWsLS3YIsoxQKTRDiGOMJCKT6LJq-"
+                      ],
+                      "cacheAgeSeconds": 41,
+                      "lastFetchedAt": "2026-10-01T05:00:00.000Z",
+                      "lastError": null
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "503": {
+            "description": "Degraded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CrmHealth"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/properties": {
+      "get": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "List properties — server-side pagination, sort and filters",
+        "description": "Scoped: tenant from the token; AGENT only sees listings assigned to them. Anything outside the scope is **404** (never 403 — that would leak existence).\n\nMax pageSize 100. Returns `total` for the grid. p95 < 300 ms on 10k rows (see DECISIONS.md §3 for indexes and EXPLAIN).",
+        "operationId": "listProperties",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "sortBy",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "id",
+                "title",
+                "listingType",
+                "bhk",
+                "furnishing",
+                "carpetAreaSqft",
+                "priceInr",
+                "pricePerSqft",
+                "buildingName",
+                "unitNo",
+                "city",
+                "ownerName",
+                "status",
+                "type",
+                "locality",
+                "assignee",
+                "createdAt",
+                "updatedAt",
+                "lastActivityAt"
+              ],
+              "default": "createdAt"
+            },
+            "description": "`status` sorts by pipeline order; `type`/`locality`/`assignee` by name"
+          },
+          {
+            "name": "sortOrder",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Status ids — repeat (`status=2&status=3`) or comma-separate (`status=2,3`)",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Property type ids",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "listingType",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "SALE",
+                "RENT"
+              ]
+            }
+          },
+          {
+            "name": "bhk",
+            "in": "query",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 20
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "locality",
+            "in": "query",
+            "description": "Locality ids",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "assignee",
+            "in": "query",
+            "description": "Agent (user) ids. ADMIN/MANAGER only — an AGENT sending it gets 403.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "amenity",
+            "in": "query",
+            "description": "Amenity ids — listing must have ALL of them",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "priceMin",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 5000000
+          },
+          {
+            "name": "priceMax",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 20000000
+          },
+          {
+            "name": "areaMin",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "areaMax",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "createdFrom",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "example": "2026-01-01T00:00:00+05:30"
+          },
+          {
+            "name": "createdTo",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "stale",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Only (non-)stale listings"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "description": "Free text over title, building, unit, locality name, owner name and owner phone digits"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PropertyPage"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Create a property",
+        "description": "Validated with the shared `propertyCreateSchema`. Uniqueness of (tenant, building, unit) is enforced by a DB unique index, so two parallel identical POSTs give exactly one 201 and one 409. Writes a CREATED activity row and emits `property:updated`.",
+        "operationId": "createProperty",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PropertyCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Property"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "AGENT tried to assign to someone else",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "FORBIDDEN_ROLE",
+                    "message": "Agents cannot assign listings to others"
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate building + unit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "DUPLICATE_LISTING",
+                    "message": "A listing with this building and unit already exists",
+                    "details": {
+                      "fields": {
+                        "unitNo": "This unit is already listed in this building"
+                      },
+                      "existingId": 1699
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/properties/export": {
+      "get": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Export the filtered view to .xlsx (ALL matching rows)",
+        "description": "Same filters as the list (pagination ignored). Streamed with ExcelJS `WorkbookWriter` straight into the response; rows are read in keyset batches (`id > lastId LIMIT 1000`) and committed one at a time, waiting for `drain` under back-pressure, so memory stays flat for 10k+ rows. `X-Total-Count` is set before the body. An AGENT gets 403 and the button is not rendered.",
+        "operationId": "exportProperties",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Status ids — repeat (`status=2&status=3`) or comma-separate (`status=2,3`)",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Property type ids",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "listingType",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "SALE",
+                "RENT"
+              ]
+            }
+          },
+          {
+            "name": "bhk",
+            "in": "query",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 20
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "locality",
+            "in": "query",
+            "description": "Locality ids",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "assignee",
+            "in": "query",
+            "description": "Agent (user) ids. ADMIN/MANAGER only — an AGENT sending it gets 403.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "amenity",
+            "in": "query",
+            "description": "Amenity ids — listing must have ALL of them",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "priceMin",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 5000000
+          },
+          {
+            "name": "priceMax",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 20000000
+          },
+          {
+            "name": "areaMin",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "areaMax",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "createdFrom",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "example": "2026-01-01T00:00:00+05:30"
+          },
+          {
+            "name": "createdTo",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "stale",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Only (non-)stale listings"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "description": "Free text over title, building, unit, locality name, owner name and owner phone digits"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Excel workbook",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              },
+              "Content-Disposition": {
+                "schema": {
+                  "type": "string",
+                  "example": "attachment; filename=\"propflow-properties-202610010930.xlsx\""
+                }
+              },
+              "X-Total-Count": {
+                "schema": {
+                  "type": "integer",
+                  "example": 10000
+                }
+              }
+            },
+            "content": {
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/properties/check-duplicate": {
+      "get": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Inline duplicate check for building + unit",
+        "operationId": "checkDuplicate",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "buildingName",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "unitNo",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "excludeId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "The listing being edited"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DuplicateCheck"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/properties/bulk": {
+      "post": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Bulk reassign / change status / add amenity (≤ 500 ids, all-or-nothing)",
+        "description": "Rows are locked FOR UPDATE inside one transaction. Any unknown/foreign id, or a Closed/Withdrawn listing on changeStatus, rolls the whole request back. One activity row per listing.",
+        "operationId": "bulkProperties",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkAction"
+              },
+              "examples": {
+                "reassign": {
+                  "value": {
+                    "action": "reassign",
+                    "ids": [
+                      101,
+                      102,
+                      103
+                    ],
+                    "assigneeId": 5
+                  }
+                },
+                "changeStatus": {
+                  "value": {
+                    "action": "changeStatus",
+                    "ids": [
+                      101,
+                      102
+                    ],
+                    "statusId": 3
+                  }
+                },
+                "addAmenity": {
+                  "value": {
+                    "action": "addAmenity",
+                    "ids": [
+                      101
+                    ],
+                    "amenityId": 4
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "description": "Nothing changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "missing": {
+                    "value": {
+                      "error": {
+                        "code": "BUSINESS_RULE",
+                        "message": "Some listings were not found; nothing was changed",
+                        "details": {
+                          "missingIds": [
+                            999999
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "terminal": {
+                    "value": {
+                      "error": {
+                        "code": "TERMINAL_STATUS",
+                        "message": "Some listings are Closed/Withdrawn and cannot change status; nothing was changed",
+                        "details": {
+                          "ids": [
+                            102
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/properties/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Property id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Property detail",
+        "description": "Scoped: tenant from the token; AGENT only sees listings assigned to them. Anything outside the scope is **404** (never 403 — that would leak existence). Owner phone is masked unless you are the assignee, a MANAGER or an ADMIN.",
+        "operationId": "getProperty",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "responses": {
+          "200": {
+            "description": "Property",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Property"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Update with optimistic locking",
+        "description": "Body must include the `version` you loaded. The row is locked FOR UPDATE; if the version is stale → 409 with the full current copy in `details.current` (drives the conflict dialog: \"Save merged\" re-sends with the latest version). Every changed field goes into property_activity as a diff. Closed/Withdrawn are terminal (422). AGENTs cannot reassign.",
+        "operationId": "updateProperty",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PropertyUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated (version incremented)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Property"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Stale version or duplicate building + unit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "versionConflict": {
+                    "value": {
+                      "error": {
+                        "code": "VERSION_CONFLICT",
+                        "message": "This listing was changed by someone else since you opened it",
+                        "details": {
+                          "yourVersion": 3,
+                          "currentVersion": 4,
+                          "current": {
+                            "id": 1699,
+                            "title": "2 BHK Apartment for sale in Powai",
+                            "listingType": "SALE",
+                            "bhk": 2,
+                            "furnishing": "SEMI_FURNISHED",
+                            "carpetAreaSqft": 720,
+                            "priceInr": 18500000,
+                            "pricePerSqft": 25694,
+                            "listedPriceInr": 19500000,
+                            "priceChangePct": -5.13,
+                            "buildingName": "Hiranandani Gardens A Wing",
+                            "unitNo": "1203",
+                            "floor": 12,
+                            "totalFloors": 22,
+                            "city": "Mumbai",
+                            "address": "Hiranandani Gardens A Wing, Powai, Mumbai",
+                            "ownerName": "Rahul Shah",
+                            "ownerPhone": "9830012321",
+                            "ownerPhoneMasked": false,
+                            "type": {
+                              "id": 1,
+                              "name": "Apartment"
+                            },
+                            "status": {
+                              "id": 3,
+                              "name": "Site Visit",
+                              "stage": "OPEN",
+                              "isTerminal": false,
+                              "sortOrder": 30
+                            },
+                            "locality": {
+                              "id": 3,
+                              "name": "Powai",
+                              "city": "Mumbai"
+                            },
+                            "assignee": {
+                              "id": 4,
+                              "name": "Riya Sharma"
+                            },
+                            "isStale": false,
+                            "lastActivityAt": "2026-09-28T09:12:00.000Z",
+                            "closedAt": null,
+                            "version": 4,
+                            "createdAt": "2026-06-03T08:33:51.000Z",
+                            "updatedAt": "2026-09-28T09:12:00.000Z",
+                            "amenities": [
+                              {
+                                "id": 1,
+                                "name": "Lift"
+                              },
+                              {
+                                "id": 2,
+                                "name": "Parking"
+                              }
+                            ],
+                            "amenityIds": [
+                              1,
+                              2
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "duplicate": {
+                    "value": {
+                      "error": {
+                        "code": "DUPLICATE_LISTING",
+                        "message": "A listing with this building and unit already exists",
+                        "details": {
+                          "fields": {
+                            "unitNo": "This unit is already listed in this building"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "description": "Terminal status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "TERMINAL_STATUS",
+                    "message": "\"Closed\" is a terminal status; the listing can no longer change stage",
+                    "details": {
+                      "fields": {
+                        "statusId": "Closed and Withdrawn listings cannot move"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Soft delete",
+        "description": "Sets deleted_at (paranoid). The unit becomes free for a new listing (the unique index only covers live rows).",
+        "operationId": "deleteProperty",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER"
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/properties/{id}/activity": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Property id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Properties"
+        ],
+        "summary": "Activity timeline (status, price, assignment changes…), newest first",
+        "operationId": "propertyActivity",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "responses": {
+          "200": {
+            "description": "Timeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Activity"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/properties/{id}/notes": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Property id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Notes & chat"
+        ],
+        "summary": "Notes on a property, newest first",
+        "operationId": "listNotes",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "responses": {
+          "200": {
+            "description": "Notes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Note"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Notes & chat"
+        ],
+        "summary": "Add a note (broadcast as `note:new` to the property room)",
+        "operationId": "addNote",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NoteCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Note"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/properties/{id}/messages": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Property id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Notes & chat"
+        ],
+        "summary": "Chat history (oldest → newest within the page)",
+        "operationId": "listMessages",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "beforeId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Load older messages"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Messages",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatHistory"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Notes & chat"
+        ],
+        "summary": "Send a chat message over REST (fallback for `chat:send`)",
+        "description": "Idempotent on (property_id, client_msg_id): the first call returns 201 and broadcasts `chat:new`; a retry with the same clientMsgId returns 200 with the original message and `duplicate: true`.",
+        "operationId": "sendMessage",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatSendRest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Retry of an already stored message",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSendResult"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "201": {
+            "description": "Stored and broadcast",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSendResult"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/site-visits": {
+      "get": {
+        "tags": [
+          "Site visits"
+        ],
+        "summary": "Calendar feed (AGENT: own visits; ADMIN/MANAGER: whole team)",
+        "operationId": "listVisits",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "example": "2026-09-28T18:30:00Z"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "example": "2026-11-08T18:30:00Z"
+          },
+          {
+            "name": "agentId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "ADMIN/MANAGER only"
+          },
+          {
+            "name": "propertyId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "404 if the property is not visible to you"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Visits ordered by time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SiteVisit"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Site visits"
+        ],
+        "summary": "Schedule a site visit (stored in UTC)",
+        "operationId": "createVisit",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SiteVisitCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Scheduled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteVisit"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/site-visits/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Site visit id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Site visits"
+        ],
+        "summary": "One visit",
+        "operationId": "getVisit",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "responses": {
+          "200": {
+            "description": "Visit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteVisit"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Site visits"
+        ],
+        "summary": "Reschedule (drag-and-drop) / record outcome",
+        "operationId": "updateVisit",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SiteVisitUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteVisit"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/dashboard": {
+      "get": {
+        "tags": [
+          "Dashboard"
+        ],
+        "summary": "KPIs + funnel, listings per day, type split, top 5 agents",
+        "description": "One call per date range. Cached 60 s per tenant + range in Redis (`dash:{tenantId}:{from}:{to}`); any property write clears the tenant’s dashboard keys.",
+        "operationId": "dashboard",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "example": "2026-09-01"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "example": "2026-09-30"
+          },
+          {
+            "name": "tz",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "default": "Asia/Kolkata"
+            },
+            "description": "IANA zone used for day buckets"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dashboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dashboard"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/master-data": {
+      "get": {
+        "tags": [
+          "Master data"
+        ],
+        "summary": "All four lists in one call (forms and filters)",
+        "operationId": "masterDataAll",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "includeInactive",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Master data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MasterDataAll"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/master-data/{kind}": {
+      "parameters": [
+        {
+          "name": "kind",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "statuses",
+              "types",
+              "localities",
+              "amenities"
+            ]
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Master data"
+        ],
+        "summary": "List one kind, in sort order (Redis read-through `md:{tenantId}:{kind}`)",
+        "operationId": "masterDataList",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "includeInactive",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MasterItemAny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Master data"
+        ],
+        "summary": "Create an item (ADMIN)",
+        "description": "Clears `md:{tenant}:*` and emits `masterdata:updated` to the tenant so open screens refetch.",
+        "operationId": "masterDataCreate",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MasterItemWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MasterItemAny"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Name exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "CONFLICT",
+                    "message": "\"Powai\" already exists",
+                    "details": {
+                      "fields": {
+                        "name": "Name already exists"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/master-data/{kind}/order": {
+      "parameters": [
+        {
+          "name": "kind",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "statuses",
+              "types",
+              "localities",
+              "amenities"
+            ]
+          }
+        }
+      ],
+      "put": {
+        "tags": [
+          "Master data"
+        ],
+        "summary": "Drag-to-reorder: ids in the new order (ADMIN)",
+        "operationId": "masterDataReorder",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "minItems": 1,
+                    "maxItems": 500
+                  }
+                },
+                "required": [
+                  "ids"
+                ]
+              },
+              "example": {
+                "ids": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "New order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MasterItemAny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/master-data/{kind}/{id}": {
+      "parameters": [
+        {
+          "name": "kind",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "statuses",
+              "types",
+              "localities",
+              "amenities"
+            ]
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Item id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "patch": {
+        "tags": [
+          "Master data"
+        ],
+        "summary": "Rename / deactivate / change stage (ADMIN)",
+        "description": "A rename is visible in every property list immediately (cache cleared, H10).",
+        "operationId": "masterDataUpdate",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MasterItemWrite"
+              },
+              "example": {
+                "name": "Powai (Hiranandani)"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MasterItemAny"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Name exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Master data"
+        ],
+        "summary": "Delete an unused item (ADMIN)",
+        "operationId": "masterDataDelete",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "description": "In use — deactivate instead",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "IN_USE",
+                    "message": "\"Apartment\" is used by 7012 listings; deactivate it instead",
+                    "details": {
+                      "usedBy": 7012,
+                      "suggestion": "deactivate"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/team": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Active users of the tenant (assignee picker, agent filter)",
+        "operationId": "team",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN",
+          "MANAGER"
+        ],
+        "responses": {
+          "200": {
+            "description": "Team",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TeamMember"
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": 4,
+                      "name": "Riya Sharma",
+                      "role": "AGENT"
+                    },
+                    {
+                      "id": 5,
+                      "name": "Kabir Singh",
+                      "role": "AGENT"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/users": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List tenant users (ADMIN)",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmListUsers",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Users",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PublicUser"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/users/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "User id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Get user (ADMIN)",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmGetUser",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "User",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicUser"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Change role / deactivate (ADMIN). Last ADMIN guarded (422).",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmUpdateUser",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUserRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "User",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicUser"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "description": "Last admin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "LAST_ADMIN",
+                    "message": "The last active admin cannot be demoted or deactivated"
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/invites": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List invites (ADMIN)",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmListInvites",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Invites",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Invite"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Invite a user (ADMIN)",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmCreateInvite",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Invite",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Email taken",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/invites/{id}/link": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Invite id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Copy link of a pending invite (ADMIN)",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmInviteLink",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Link",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/invites/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Invite id",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "delete": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Revoke invite (ADMIN)",
+        "description": "Forwarded to auth-server with the caller’s bearer token (identity lives in auth_db; the two services never share a database). auth-server re-checks role and tenant.",
+        "operationId": "crmRevokeInvite",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Invite",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Invite"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    },
+    "/platform/tenant-stats": {
+      "get": {
+        "tags": [
+          "Platform"
+        ],
+        "summary": "Property counts per tenant (SUPER_ADMIN, counts only)",
+        "operationId": "tenantStats",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-roles": [
+          "SUPER_ADMIN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TenantStats"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT (RS256)",
+        "description": "Access token from `/auth/login`, `/auth/refresh`, `/auth/register-tenant` or `/auth/accept-invite`. RS256, header carries `kid`; claims `sub`, `tid`, `role`, `name`, `jti`, `iat`, `exp`, `iss=propflow-auth`, `aud=propflow`. 60 s lifetime in the deployed build. Keep it in memory only."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "The one error shape returned by both services for every non-2xx response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "VALIDATION_ERROR",
+                  "UNAUTHENTICATED",
+                  "TOKEN_EXPIRED",
+                  "INVALID_TOKEN",
+                  "INVALID_CREDENTIALS",
+                  "REFRESH_INVALID",
+                  "REFRESH_REUSED",
+                  "FORBIDDEN_ROLE",
+                  "FORBIDDEN_ORIGIN",
+                  "NOT_FOUND",
+                  "VERSION_CONFLICT",
+                  "DUPLICATE_LISTING",
+                  "CONFLICT",
+                  "EMAIL_TAKEN",
+                  "SLUG_TAKEN",
+                  "BUSINESS_RULE",
+                  "LAST_ADMIN",
+                  "IN_USE",
+                  "TERMINAL_STATUS",
+                  "INVITE_INVALID",
+                  "ACCOUNT_DISABLED",
+                  "RATE_LIMITED",
+                  "INTERNAL",
+                  "SERVICE_UNAVAILABLE"
+                ],
+                "description": "Stable machine-readable code"
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable message (safe to show in the UI)"
+              },
+              "details": {
+                "description": "Optional, code-specific. For VALIDATION_ERROR it is `ValidationErrorDetails`; for VERSION_CONFLICT it carries the current server copy.",
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ValidationErrorDetails"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        }
+      },
+      "ValidationErrorDetails": {
+        "type": "object",
+        "properties": {
+          "fields": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Field path → first error message. The web app maps these onto react-hook-form inputs.",
+            "example": {
+              "priceInr": "Price must be greater than 0",
+              "ownerPhone": "Enter a valid 10-digit Indian mobile number"
+            }
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "fields"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "SUPER_ADMIN",
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ]
+      },
+      "TenantRole": {
+        "type": "string",
+        "enum": [
+          "ADMIN",
+          "MANAGER",
+          "AGENT"
+        ]
+      },
+      "HealthCheck": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down"
+            ]
+          },
+          "latencyMs": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "Ref": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "StatusRef": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "OPEN",
+              "WON",
+              "LOST"
+            ]
+          },
+          "isTerminal": {
+            "type": "boolean"
+          },
+          "sortOrder": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "LocalityRef": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "PropertyListItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "listingType": {
+            "type": "string",
+            "enum": [
+              "SALE",
+              "RENT"
+            ]
+          },
+          "bhk": {
+            "type": "integer"
+          },
+          "furnishing": {
+            "type": "string",
+            "enum": [
+              "UNFURNISHED",
+              "SEMI_FURNISHED",
+              "FULLY_FURNISHED"
+            ]
+          },
+          "carpetAreaSqft": {
+            "type": "integer"
+          },
+          "priceInr": {
+            "type": "integer"
+          },
+          "pricePerSqft": {
+            "type": "integer",
+            "description": "Computed: round(priceInr / carpetAreaSqft)",
+            "nullable": true
+          },
+          "listedPriceInr": {
+            "type": "integer",
+            "description": "Price when first listed"
+          },
+          "priceChangePct": {
+            "type": "number",
+            "description": "Change since listing, in %"
+          },
+          "buildingName": {
+            "type": "string"
+          },
+          "unitNo": {
+            "type": "string"
+          },
+          "floor": {
+            "type": "integer",
+            "nullable": true
+          },
+          "totalFloors": {
+            "type": "integer",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "address": {
+            "type": "string",
+            "nullable": true
+          },
+          "ownerName": {
+            "type": "string"
+          },
+          "ownerPhone": {
+            "type": "string",
+            "description": "Full number for ADMIN/MANAGER and the assignee; otherwise masked in the serializer as `98300 •••21`"
+          },
+          "ownerPhoneMasked": {
+            "type": "boolean"
+          },
+          "type": {
+            "$ref": "#/components/schemas/Ref"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusRef"
+          },
+          "locality": {
+            "$ref": "#/components/schemas/LocalityRef"
+          },
+          "assignee": {
+            "type": "object",
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Ref"
+              }
+            ]
+          },
+          "isStale": {
+            "type": "boolean",
+            "description": "Set by the nightly job after 30 days without activity"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "closedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "version": {
+            "type": "integer",
+            "description": "Optimistic-locking version; send it back on PATCH"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "listingType",
+          "priceInr",
+          "status",
+          "version"
+        ],
+        "example": {
+          "id": 1699,
+          "title": "2 BHK Apartment for sale in Powai",
+          "listingType": "SALE",
+          "bhk": 2,
+          "furnishing": "SEMI_FURNISHED",
+          "carpetAreaSqft": 720,
+          "priceInr": 18500000,
+          "pricePerSqft": 25694,
+          "listedPriceInr": 19500000,
+          "priceChangePct": -5.13,
+          "buildingName": "Hiranandani Gardens A Wing",
+          "unitNo": "1203",
+          "floor": 12,
+          "totalFloors": 22,
+          "city": "Mumbai",
+          "address": "Hiranandani Gardens A Wing, Powai, Mumbai",
+          "ownerName": "Rahul Shah",
+          "ownerPhone": "9830012321",
+          "ownerPhoneMasked": false,
+          "type": {
+            "id": 1,
+            "name": "Apartment"
+          },
+          "status": {
+            "id": 3,
+            "name": "Site Visit",
+            "stage": "OPEN",
+            "isTerminal": false,
+            "sortOrder": 30
+          },
+          "locality": {
+            "id": 3,
+            "name": "Powai",
+            "city": "Mumbai"
+          },
+          "assignee": {
+            "id": 4,
+            "name": "Riya Sharma"
+          },
+          "isStale": false,
+          "lastActivityAt": "2026-09-28T09:12:00.000Z",
+          "closedAt": null,
+          "version": 4,
+          "createdAt": "2026-06-03T08:33:51.000Z",
+          "updatedAt": "2026-09-28T09:12:00.000Z"
+        }
+      },
+      "Property": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PropertyListItem"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "amenities": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Ref"
+                }
+              },
+              "amenityIds": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        ],
+        "example": {
+          "id": 1699,
+          "title": "2 BHK Apartment for sale in Powai",
+          "listingType": "SALE",
+          "bhk": 2,
+          "furnishing": "SEMI_FURNISHED",
+          "carpetAreaSqft": 720,
+          "priceInr": 18500000,
+          "pricePerSqft": 25694,
+          "listedPriceInr": 19500000,
+          "priceChangePct": -5.13,
+          "buildingName": "Hiranandani Gardens A Wing",
+          "unitNo": "1203",
+          "floor": 12,
+          "totalFloors": 22,
+          "city": "Mumbai",
+          "address": "Hiranandani Gardens A Wing, Powai, Mumbai",
+          "ownerName": "Rahul Shah",
+          "ownerPhone": "9830012321",
+          "ownerPhoneMasked": false,
+          "type": {
+            "id": 1,
+            "name": "Apartment"
+          },
+          "status": {
+            "id": 3,
+            "name": "Site Visit",
+            "stage": "OPEN",
+            "isTerminal": false,
+            "sortOrder": 30
+          },
+          "locality": {
+            "id": 3,
+            "name": "Powai",
+            "city": "Mumbai"
+          },
+          "assignee": {
+            "id": 4,
+            "name": "Riya Sharma"
+          },
+          "isStale": false,
+          "lastActivityAt": "2026-09-28T09:12:00.000Z",
+          "closedAt": null,
+          "version": 4,
+          "createdAt": "2026-06-03T08:33:51.000Z",
+          "updatedAt": "2026-09-28T09:12:00.000Z",
+          "amenities": [
+            {
+              "id": 1,
+              "name": "Lift"
+            },
+            {
+              "id": 2,
+              "name": "Parking"
+            }
+          ],
+          "amenityIds": [
+            1,
+            2
+          ]
+        }
+      },
+      "PropertyCreate": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 200,
+            "x-section": "Basics"
+          },
+          "typeId": {
+            "type": "integer",
+            "description": "property_types.id (active)",
+            "x-section": "Basics"
+          },
+          "listingType": {
+            "type": "string",
+            "enum": [
+              "SALE",
+              "RENT"
+            ],
+            "x-section": "Basics"
+          },
+          "bhk": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 20,
+            "description": "0 for plots / commercial",
+            "x-section": "Basics"
+          },
+          "furnishing": {
+            "type": "string",
+            "enum": [
+              "UNFURNISHED",
+              "SEMI_FURNISHED",
+              "FULLY_FURNISHED"
+            ],
+            "default": "UNFURNISHED",
+            "x-section": "Basics"
+          },
+          "statusId": {
+            "type": "integer",
+            "description": "Defaults to the first open status (Draft)",
+            "x-section": "Basics"
+          },
+          "buildingName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 150,
+            "x-section": "Location"
+          },
+          "unitNo": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "description": "Unique per (tenant, building) among live listings",
+            "x-section": "Location"
+          },
+          "floor": {
+            "type": "integer",
+            "minimum": -5,
+            "maximum": 200,
+            "x-section": "Location",
+            "nullable": true
+          },
+          "totalFloors": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200,
+            "x-section": "Location",
+            "nullable": true
+          },
+          "localityId": {
+            "type": "integer",
+            "x-section": "Location"
+          },
+          "city": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 80,
+            "x-section": "Location"
+          },
+          "address": {
+            "type": "string",
+            "maxLength": 500,
+            "x-section": "Location",
+            "nullable": true
+          },
+          "priceInr": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000000000,
+            "description": "Whole rupees. Sale price, or monthly rent for RENT",
+            "x-section": "Pricing & size"
+          },
+          "carpetAreaSqft": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "x-section": "Pricing & size"
+          },
+          "ownerName": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120,
+            "x-section": "Owner"
+          },
+          "ownerPhone": {
+            "type": "string",
+            "description": "Indian mobile; `+91`/`0` prefix, spaces and dashes accepted; stored as 10 digits",
+            "pattern": "^(?:\\+91|91|0)?[6-9]\\d{9}$",
+            "example": "+91 98300 12321",
+            "x-section": "Owner"
+          },
+          "amenityIds": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 50,
+            "default": [],
+            "x-section": "Amenities"
+          },
+          "assigneeId": {
+            "type": "integer",
+            "description": "ADMIN/MANAGER only. An AGENT’s listings are always assigned to themselves (a different value → 403).",
+            "nullable": true
+          }
+        },
+        "required": [
+          "title",
+          "typeId",
+          "listingType",
+          "bhk",
+          "buildingName",
+          "unitNo",
+          "localityId",
+          "city",
+          "priceInr",
+          "carpetAreaSqft",
+          "ownerName",
+          "ownerPhone"
+        ],
+        "description": "Shared Zod schema `propertyCreateSchema` (packages/shared). Sections mirror the 5-section form. `floor` must be ≤ `totalFloors`.",
+        "example": {
+          "title": "2 BHK Apartment for sale in Powai",
+          "typeId": 1,
+          "listingType": "SALE",
+          "bhk": 2,
+          "furnishing": "SEMI_FURNISHED",
+          "buildingName": "Hiranandani Gardens A Wing",
+          "unitNo": "1203",
+          "floor": 12,
+          "totalFloors": 22,
+          "localityId": 3,
+          "city": "Mumbai",
+          "address": "Hiranandani Gardens, Powai",
+          "priceInr": 18500000,
+          "carpetAreaSqft": 720,
+          "ownerName": "Rahul Shah",
+          "ownerPhone": "+91 98300 12321",
+          "amenityIds": [
+            1,
+            2
+          ]
+        }
+      },
+      "PropertyUpdate": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 200,
+            "x-section": "Basics"
+          },
+          "typeId": {
+            "type": "integer",
+            "description": "property_types.id (active)",
+            "x-section": "Basics"
+          },
+          "listingType": {
+            "type": "string",
+            "enum": [
+              "SALE",
+              "RENT"
+            ],
+            "x-section": "Basics"
+          },
+          "bhk": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 20,
+            "description": "0 for plots / commercial",
+            "x-section": "Basics"
+          },
+          "furnishing": {
+            "type": "string",
+            "enum": [
+              "UNFURNISHED",
+              "SEMI_FURNISHED",
+              "FULLY_FURNISHED"
+            ],
+            "default": "UNFURNISHED",
+            "x-section": "Basics"
+          },
+          "statusId": {
+            "type": "integer",
+            "description": "Defaults to the first open status (Draft)",
+            "x-section": "Basics"
+          },
+          "buildingName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 150,
+            "x-section": "Location"
+          },
+          "unitNo": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "description": "Unique per (tenant, building) among live listings",
+            "x-section": "Location"
+          },
+          "floor": {
+            "type": "integer",
+            "minimum": -5,
+            "maximum": 200,
+            "x-section": "Location",
+            "nullable": true
+          },
+          "totalFloors": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200,
+            "x-section": "Location",
+            "nullable": true
+          },
+          "localityId": {
+            "type": "integer",
+            "x-section": "Location"
+          },
+          "city": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 80,
+            "x-section": "Location"
+          },
+          "address": {
+            "type": "string",
+            "maxLength": 500,
+            "x-section": "Location",
+            "nullable": true
+          },
+          "priceInr": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000000000,
+            "description": "Whole rupees. Sale price, or monthly rent for RENT",
+            "x-section": "Pricing & size"
+          },
+          "carpetAreaSqft": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "x-section": "Pricing & size"
+          },
+          "ownerName": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120,
+            "x-section": "Owner"
+          },
+          "ownerPhone": {
+            "type": "string",
+            "description": "Indian mobile; `+91`/`0` prefix, spaces and dashes accepted; stored as 10 digits",
+            "pattern": "^(?:\\+91|91|0)?[6-9]\\d{9}$",
+            "example": "+91 98300 12321",
+            "x-section": "Owner"
+          },
+          "amenityIds": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 50,
+            "default": [],
+            "x-section": "Amenities"
+          },
+          "assigneeId": {
+            "type": "integer",
+            "description": "ADMIN/MANAGER only. An AGENT’s listings are always assigned to themselves (a different value → 403).",
+            "nullable": true
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The version you loaded. Stale → 409 VERSION_CONFLICT."
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "description": "Partial update. Every changed field is written to property_activity as a JSON diff (incl. price history).",
+        "example": {
+          "version": 4,
+          "priceInr": 17900000,
+          "statusId": 4
+        }
+      },
+      "PropertyPage": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PropertyListItem"
+            }
+          },
+          "page": {
+            "type": "integer"
+          },
+          "pageSize": {
+            "type": "integer",
+            "maximum": 100
+          },
+          "total": {
+            "type": "integer",
+            "description": "All rows matching the filters"
+          },
+          "totalPages": {
+            "type": "integer"
+          },
+          "sortBy": {
+            "type": "string",
+            "enum": [
+              "id",
+              "title",
+              "listingType",
+              "bhk",
+              "furnishing",
+              "carpetAreaSqft",
+              "priceInr",
+              "pricePerSqft",
+              "buildingName",
+              "unitNo",
+              "city",
+              "ownerName",
+              "status",
+              "type",
+              "locality",
+              "assignee",
+              "createdAt",
+              "updatedAt",
+              "lastActivityAt"
+            ]
+          },
+          "sortOrder": {
+            "type": "string",
+            "enum": [
+              "asc",
+              "desc"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "page",
+          "pageSize",
+          "total",
+          "totalPages"
+        ],
+        "example": {
+          "data": [
+            {
+              "id": 1699,
+              "title": "2 BHK Apartment for sale in Powai",
+              "listingType": "SALE",
+              "bhk": 2,
+              "furnishing": "SEMI_FURNISHED",
+              "carpetAreaSqft": 720,
+              "priceInr": 18500000,
+              "pricePerSqft": 25694,
+              "listedPriceInr": 19500000,
+              "priceChangePct": -5.13,
+              "buildingName": "Hiranandani Gardens A Wing",
+              "unitNo": "1203",
+              "floor": 12,
+              "totalFloors": 22,
+              "city": "Mumbai",
+              "address": "Hiranandani Gardens A Wing, Powai, Mumbai",
+              "ownerName": "Rahul Shah",
+              "ownerPhone": "9830012321",
+              "ownerPhoneMasked": false,
+              "type": {
+                "id": 1,
+                "name": "Apartment"
+              },
+              "status": {
+                "id": 3,
+                "name": "Site Visit",
+                "stage": "OPEN",
+                "isTerminal": false,
+                "sortOrder": 30
+              },
+              "locality": {
+                "id": 3,
+                "name": "Powai",
+                "city": "Mumbai"
+              },
+              "assignee": {
+                "id": 4,
+                "name": "Riya Sharma"
+              },
+              "isStale": false,
+              "lastActivityAt": "2026-09-28T09:12:00.000Z",
+              "closedAt": null,
+              "version": 4,
+              "createdAt": "2026-06-03T08:33:51.000Z",
+              "updatedAt": "2026-09-28T09:12:00.000Z"
+            }
+          ],
+          "page": 1,
+          "pageSize": 25,
+          "total": 10482,
+          "totalPages": 420,
+          "sortBy": "createdAt",
+          "sortOrder": "desc"
+        }
+      },
+      "VersionConflict": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Error"
+          }
+        ],
+        "example": {
+          "error": {
+            "code": "VERSION_CONFLICT",
+            "message": "This listing was changed by someone else since you opened it",
+            "details": {
+              "yourVersion": 3,
+              "currentVersion": 4,
+              "current": {
+                "id": 1699,
+                "title": "2 BHK Apartment for sale in Powai",
+                "listingType": "SALE",
+                "bhk": 2,
+                "furnishing": "SEMI_FURNISHED",
+                "carpetAreaSqft": 720,
+                "priceInr": 18500000,
+                "pricePerSqft": 25694,
+                "listedPriceInr": 19500000,
+                "priceChangePct": -5.13,
+                "buildingName": "Hiranandani Gardens A Wing",
+                "unitNo": "1203",
+                "floor": 12,
+                "totalFloors": 22,
+                "city": "Mumbai",
+                "address": "Hiranandani Gardens A Wing, Powai, Mumbai",
+                "ownerName": "Rahul Shah",
+                "ownerPhone": "9830012321",
+                "ownerPhoneMasked": false,
+                "type": {
+                  "id": 1,
+                  "name": "Apartment"
+                },
+                "status": {
+                  "id": 3,
+                  "name": "Site Visit",
+                  "stage": "OPEN",
+                  "isTerminal": false,
+                  "sortOrder": 30
+                },
+                "locality": {
+                  "id": 3,
+                  "name": "Powai",
+                  "city": "Mumbai"
+                },
+                "assignee": {
+                  "id": 4,
+                  "name": "Riya Sharma"
+                },
+                "isStale": false,
+                "lastActivityAt": "2026-09-28T09:12:00.000Z",
+                "closedAt": null,
+                "version": 4,
+                "createdAt": "2026-06-03T08:33:51.000Z",
+                "updatedAt": "2026-09-28T09:12:00.000Z",
+                "amenities": [
+                  {
+                    "id": 1,
+                    "name": "Lift"
+                  },
+                  {
+                    "id": 2,
+                    "name": "Parking"
+                  }
+                ],
+                "amenityIds": [
+                  1,
+                  2
+                ]
+              }
+            }
+          }
+        },
+        "description": "`details.current` is the full server copy, used by the conflict dialog (Theirs vs Yours per field)."
+      },
+      "BulkAction": {
+        "description": "Up to 500 ids, one transaction, all-or-nothing. Ids outside your tenant count as missing → 422 and nothing changes.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "reassign"
+                ]
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "minItems": 1,
+                "maxItems": 500
+              },
+              "assigneeId": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "action",
+              "ids",
+              "assigneeId"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "changeStatus"
+                ]
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "minItems": 1,
+                "maxItems": 500
+              },
+              "statusId": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "action",
+              "ids",
+              "statusId"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "addAmenity"
+                ]
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "minItems": 1,
+                "maxItems": 500
+              },
+              "amenityId": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "action",
+              "ids",
+              "amenityId"
+            ]
+          }
+        ],
+        "discriminator": {
+          "propertyName": "action"
+        }
+      },
+      "BulkResult": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "affected": {
+            "type": "integer"
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "action",
+          "affected",
+          "ids"
+        ],
+        "example": {
+          "action": "reassign",
+          "affected": 50,
+          "ids": [
+            101,
+            102
+          ]
+        }
+      },
+      "DuplicateCheck": {
+        "type": "object",
+        "properties": {
+          "duplicate": {
+            "type": "boolean"
+          },
+          "existingId": {
+            "type": "integer",
+            "description": "Only when you may see that listing"
+          }
+        },
+        "required": [
+          "duplicate"
+        ],
+        "example": {
+          "duplicate": true,
+          "existingId": 1699
+        }
+      },
+      "Activity": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "CREATED",
+              "UPDATED",
+              "DELETED",
+              "BULK_REASSIGN",
+              "BULK_STATUS",
+              "BULK_AMENITY",
+              "MARKED_STALE"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "nullable": true
+          },
+          "diff": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "from": {},
+                "to": {},
+                "fromLabel": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "toLabel": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            },
+            "nullable": true
+          },
+          "actor": {
+            "type": "object",
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Ref"
+              }
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "id": 991,
+          "action": "UPDATED",
+          "summary": "Status: Listed → Site Visit; Price: ₹1.95 Cr → ₹1.85 Cr",
+          "diff": {
+            "statusId": {
+              "from": 2,
+              "to": 3,
+              "fromLabel": "Listed",
+              "toLabel": "Site Visit"
+            },
+            "priceInr": {
+              "from": 19500000,
+              "to": 18500000,
+              "fromLabel": "₹1.95 Cr",
+              "toLabel": "₹1.85 Cr"
+            }
+          },
+          "actor": {
+            "id": 4,
+            "name": "Riya Sharma"
+          },
+          "createdAt": "2026-09-28T09:12:00.000Z"
+        }
+      },
+      "Note": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "propertyId": {
+            "type": "integer"
+          },
+          "body": {
+            "type": "string"
+          },
+          "author": {
+            "$ref": "#/components/schemas/Ref"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "NoteCreate": {
+        "type": "object",
+        "properties": {
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 5000
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "example": {
+          "body": "Owner open to negotiation; prefers closure before Diwali."
+        }
+      },
+      "ChatMessage": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "propertyId": {
+            "type": "integer"
+          },
+          "clientMsgId": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "sender": {
+            "$ref": "#/components/schemas/Ref"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "id": 5521,
+          "propertyId": 1699,
+          "clientMsgId": "c-01J9Z3K4",
+          "body": "Owner confirmed Saturday 11 AM",
+          "sender": {
+            "id": 4,
+            "name": "Riya Sharma"
+          },
+          "createdAt": "2026-10-01T05:20:11.000Z"
+        }
+      },
+      "ChatSendRest": {
+        "type": "object",
+        "properties": {
+          "clientMsgId": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "description": "Client-generated; unique per property; reuse it on retry"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        },
+        "required": [
+          "clientMsgId",
+          "body"
+        ],
+        "example": {
+          "clientMsgId": "c-01J9Z3K4",
+          "body": "Owner confirmed Saturday 11 AM"
+        }
+      },
+      "ChatSendResult": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/ChatMessage"
+          },
+          "duplicate": {
+            "type": "boolean",
+            "description": "true when this client_msg_id was already stored (nothing new written or broadcast)"
+          }
+        }
+      },
+      "ChatHistory": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatMessage"
+            }
+          },
+          "nextBeforeId": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "SiteVisit": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "propertyId": {
+            "type": "integer"
+          },
+          "agent": {
+            "$ref": "#/components/schemas/Ref"
+          },
+          "visitAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC (Z). Render in the user’s zone."
+          },
+          "endAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "durationMinutes": {
+            "type": "integer"
+          },
+          "visitorName": {
+            "type": "string",
+            "nullable": true
+          },
+          "visitorPhone": {
+            "type": "string",
+            "nullable": true
+          },
+          "notes": {
+            "type": "string",
+            "nullable": true
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "SCHEDULED",
+              "COMPLETED",
+              "NO_SHOW",
+              "CANCELLED",
+              "INTERESTED",
+              "NOT_INTERESTED"
+            ]
+          },
+          "isOverdue": {
+            "type": "boolean",
+            "description": "SCHEDULED and in the past (drawn red)"
+          },
+          "remindedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "property": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "title": {
+                "type": "string"
+              },
+              "buildingName": {
+                "type": "string"
+              },
+              "unitNo": {
+                "type": "string"
+              },
+              "ownerName": {
+                "type": "string"
+              },
+              "ownerPhone": {
+                "type": "string",
+                "description": "Masked when the viewer is an agent who is not the listing’s assignee"
+              },
+              "ownerPhoneMasked": {
+                "type": "boolean"
+              },
+              "assigneeId": {
+                "type": "integer",
+                "nullable": true
+              }
+            },
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "id": 77,
+          "propertyId": 1699,
+          "agent": {
+            "id": 4,
+            "name": "Riya Sharma"
+          },
+          "visitAt": "2026-10-01T04:30:00.000Z",
+          "endAt": "2026-10-01T05:30:00.000Z",
+          "durationMinutes": 60,
+          "visitorName": "Amit Joshi",
+          "visitorPhone": null,
+          "notes": null,
+          "outcome": "SCHEDULED",
+          "isOverdue": false,
+          "remindedAt": null,
+          "property": {
+            "id": 1699,
+            "title": "2 BHK Apartment for sale in Powai",
+            "buildingName": "Hiranandani Gardens A Wing",
+            "unitNo": "1203",
+            "ownerName": "Rahul Shah",
+            "ownerPhone": "9830012321",
+            "ownerPhoneMasked": false,
+            "assigneeId": 4
+          },
+          "createdAt": "2026-09-29T10:00:00.000Z",
+          "updatedAt": "2026-09-29T10:00:00.000Z"
+        }
+      },
+      "SiteVisitCreate": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "integer"
+          },
+          "visitAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO-8601 with offset; stored as UTC. `2026-10-01T10:00:00+05:30` → `2026-10-01T04:30:00Z`"
+          },
+          "durationMinutes": {
+            "type": "integer",
+            "minimum": 15,
+            "maximum": 480,
+            "default": 60
+          },
+          "visitorName": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "visitorPhone": {
+            "type": "string",
+            "maxLength": 20
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "agentId": {
+            "type": "integer",
+            "description": "ADMIN/MANAGER may schedule for another agent (defaults to the listing’s assignee). AGENT: self only."
+          }
+        },
+        "required": [
+          "propertyId",
+          "visitAt"
+        ],
+        "example": {
+          "propertyId": 1699,
+          "visitAt": "2026-10-01T10:00:00+05:30",
+          "durationMinutes": 60,
+          "visitorName": "Amit Joshi"
+        }
+      },
+      "SiteVisitUpdate": {
+        "type": "object",
+        "properties": {
+          "visitAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Drag-and-drop reschedule. Changing it re-arms the 15-minute reminder."
+          },
+          "durationMinutes": {
+            "type": "integer",
+            "minimum": 15,
+            "maximum": 480
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "SCHEDULED",
+              "COMPLETED",
+              "NO_SHOW",
+              "CANCELLED",
+              "INTERESTED",
+              "NOT_INTERESTED"
+            ]
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 2000,
+            "nullable": true
+          },
+          "agentId": {
+            "type": "integer",
+            "description": "ADMIN/MANAGER only"
+          }
+        },
+        "minProperties": 1,
+        "example": {
+          "visitAt": "2026-10-02T06:00:00Z"
+        }
+      },
+      "Dashboard": {
+        "type": "object",
+        "properties": {
+          "range": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date"
+              },
+              "to": {
+                "type": "string",
+                "format": "date"
+              },
+              "tz": {
+                "type": "string"
+              }
+            }
+          },
+          "kpis": {
+            "type": "object",
+            "properties": {
+              "newListings": {
+                "type": "integer"
+              },
+              "activeListings": {
+                "type": "integer"
+              },
+              "closedDeals": {
+                "type": "integer"
+              },
+              "closedValue": {
+                "type": "integer",
+                "description": "₹"
+              },
+              "avgPricePerSqft": {
+                "type": "integer",
+                "nullable": true
+              }
+            }
+          },
+          "listingsOverTime": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "format": "date"
+                },
+                "total": {
+                  "type": "integer"
+                },
+                "sale": {
+                  "type": "integer"
+                },
+                "rent": {
+                  "type": "integer"
+                }
+              }
+            },
+            "description": "One entry per day (zero-filled), bucketed in `tz`"
+          },
+          "funnel": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "statusId": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "stage": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer",
+                  "description": "Currently at this stage"
+                },
+                "reached": {
+                  "type": "integer",
+                  "description": "At or beyond this stage"
+                }
+              }
+            }
+          },
+          "lost": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "statusId": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "typeSplit": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "typeId": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "value": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "topAgents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "agentId": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "closedCount": {
+                  "type": "integer"
+                },
+                "closedValue": {
+                  "type": "integer"
+                }
+              }
+            },
+            "maxItems": 5
+          },
+          "isEmpty": {
+            "type": "boolean",
+            "description": "Drives the empty state"
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "cached": {
+            "type": "boolean"
+          }
+        },
+        "example": {
+          "range": {
+            "from": "2026-09-01",
+            "to": "2026-09-30",
+            "tz": "Asia/Kolkata"
+          },
+          "kpis": {
+            "newListings": 842,
+            "activeListings": 7498,
+            "closedDeals": 141,
+            "closedValue": 2310450000,
+            "avgPricePerSqft": 19191
+          },
+          "listingsOverTime": [
+            {
+              "date": "2026-09-01",
+              "total": 31,
+              "sale": 22,
+              "rent": 9
+            }
+          ],
+          "funnel": [
+            {
+              "statusId": 1,
+              "name": "Draft",
+              "stage": "OPEN",
+              "count": 51,
+              "reached": 842
+            },
+            {
+              "statusId": 5,
+              "name": "Closed",
+              "stage": "WON",
+              "count": 141,
+              "reached": 141
+            }
+          ],
+          "lost": [
+            {
+              "statusId": 6,
+              "name": "Withdrawn",
+              "count": 62
+            }
+          ],
+          "typeSplit": [
+            {
+              "typeId": 1,
+              "name": "Apartment",
+              "count": 590,
+              "value": 9800000000
+            }
+          ],
+          "topAgents": [
+            {
+              "agentId": 5,
+              "name": "Kabir Singh",
+              "closedCount": 73,
+              "closedValue": 1204000000
+            }
+          ],
+          "isEmpty": false,
+          "generatedAt": "2026-10-01T05:00:00.000Z",
+          "cached": false
+        }
+      },
+      "StatusItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "sortOrder": {
+            "type": "integer"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "OPEN",
+              "WON",
+              "LOST"
+            ]
+          },
+          "isTerminal": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string",
+            "description": "Stable key of seeded statuses (draft, listed, site_visit, negotiation, closed, withdrawn)",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "sortOrder",
+          "isActive"
+        ],
+        "example": {
+          "id": 5,
+          "name": "Closed",
+          "sortOrder": 50,
+          "isActive": true,
+          "stage": "WON",
+          "isTerminal": true,
+          "key": "closed"
+        }
+      },
+      "LocalityItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "sortOrder": {
+            "type": "integer"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "sortOrder",
+          "isActive"
+        ],
+        "example": {
+          "id": 3,
+          "name": "Powai",
+          "sortOrder": 30,
+          "isActive": true,
+          "city": "Mumbai"
+        }
+      },
+      "MasterItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "sortOrder": {
+            "type": "integer"
+          },
+          "isActive": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "sortOrder",
+          "isActive"
+        ],
+        "example": {
+          "id": 1,
+          "name": "Apartment",
+          "sortOrder": 10,
+          "isActive": true
+        }
+      },
+      "MasterItemAny": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/StatusItem"
+          },
+          {
+            "$ref": "#/components/schemas/LocalityItem"
+          },
+          {
+            "$ref": "#/components/schemas/MasterItem"
+          }
+        ]
+      },
+      "MasterItemWrite": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "sortOrder": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "OPEN",
+              "WON",
+              "LOST"
+            ],
+            "description": "`statuses` only (default OPEN). WON/LOST are terminal."
+          },
+          "city": {
+            "type": "string",
+            "description": "`localities` only (required on create)"
+          }
+        },
+        "example": {
+          "name": "Hiranandani Estate",
+          "city": "Thane"
+        }
+      },
+      "MasterDataAll": {
+        "type": "object",
+        "properties": {
+          "statuses": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatusItem"
+            }
+          },
+          "types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MasterItem"
+            }
+          },
+          "localities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalityItem"
+            }
+          },
+          "amenities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MasterItem"
+            }
+          }
+        }
+      },
+      "TeamMember": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          }
+        }
+      },
+      "TenantStats": {
+        "type": "object",
+        "properties": {
+          "tenantId": {
+            "type": "integer"
+          },
+          "properties": {
+            "type": "integer"
+          },
+          "activeProperties": {
+            "type": "integer"
+          },
+          "closedProperties": {
+            "type": "integer"
+          }
+        },
+        "example": {
+          "tenantId": 1,
+          "properties": 10000,
+          "activeProperties": 7498,
+          "closedProperties": 1702
+        }
+      },
+      "CrmHealth": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "service": {
+            "type": "string",
+            "example": "crm-api"
+          },
+          "instance": {
+            "type": "string",
+            "description": "Which crm-api instance answered (useful behind nginx with scale=2)"
+          },
+          "version": {
+            "type": "string"
+          },
+          "uptimeSeconds": {
+            "type": "integer"
+          },
+          "checks": {
+            "type": "object",
+            "properties": {
+              "mysql": {
+                "$ref": "#/components/schemas/HealthCheck"
+              },
+              "redis": {
+                "$ref": "#/components/schemas/HealthCheck"
+              },
+              "jwks": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "up",
+                      "down"
+                    ]
+                  },
+                  "kids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "cacheAgeSeconds": {
+                    "type": "integer",
+                    "nullable": true
+                  },
+                  "lastFetchedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "nullable": true
+                  },
+                  "lastError": {
+                    "type": "string",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "PublicUser": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "example": 3
+          },
+          "tenantId": {
+            "type": "integer",
+            "example": 1,
+            "description": "null for SUPER_ADMIN",
+            "nullable": true
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "lastLoginAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "email",
+          "name",
+          "role",
+          "isActive"
+        ],
+        "example": {
+          "id": 3,
+          "tenantId": 1,
+          "email": "manager@skyline.dev",
+          "name": "Neha Kapoor",
+          "role": "MANAGER",
+          "isActive": true,
+          "lastLoginAt": "2026-10-01T04:31:10.000Z",
+          "createdAt": "2026-09-01T10:00:00.000Z"
+        }
+      },
+      "Invite": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "tenantId": {
+            "type": "integer"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "invitedBy": {
+            "type": "integer",
+            "nullable": true
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "acceptedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "revokedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "ACCEPTED",
+              "REVOKED",
+              "EXPIRED"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "InviteRequest": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          }
+        },
+        "required": [
+          "email",
+          "name",
+          "role"
+        ],
+        "example": {
+          "email": "rahul@skyline.dev",
+          "name": "Rahul Verma",
+          "role": "AGENT"
+        }
+      },
+      "InviteResponse": {
+        "type": "object",
+        "properties": {
+          "invite": {
+            "$ref": "#/components/schemas/Invite"
+          },
+          "inviteUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "Signed, single-use, 24 h. Also written to the logs (no real email is sent)."
+          },
+          "inviteToken": {
+            "type": "string",
+            "description": "RS256 JWT (typ=invite, aud=propflow:invite, jti=invite id)"
+          }
+        },
+        "required": [
+          "invite",
+          "inviteUrl",
+          "inviteToken"
+        ],
+        "example": {
+          "invite": {
+            "id": 12,
+            "tenantId": 1,
+            "email": "rahul@skyline.dev",
+            "name": "Rahul Verma",
+            "role": "AGENT",
+            "invitedBy": 2,
+            "expiresAt": "2026-10-02T04:31:10.000Z",
+            "acceptedAt": null,
+            "revokedAt": null,
+            "state": "PENDING",
+            "createdAt": "2026-10-01T04:31:10.000Z"
+          },
+          "inviteUrl": "https://propflow-yourname.web.app/accept-invite?token=eyJhbGciOiJSUzI1NiIs…",
+          "inviteToken": "eyJhbGciOiJSUzI1NiIs…"
+        }
+      },
+      "UpdateUserRequest": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          }
+        },
+        "minProperties": 1,
+        "example": {
+          "role": "MANAGER"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "400 — request failed validation against the shared Zod schema",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "details": {
+                  "fields": {
+                    "email": "Invalid email"
+                  },
+                  "issues": [
+                    {
+                      "path": "email",
+                      "code": "invalid_string",
+                      "message": "Invalid email"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "401 — missing, invalid or expired access token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "missing": {
+                "value": {
+                  "error": {
+                    "code": "UNAUTHENTICATED",
+                    "message": "Authentication required"
+                  }
+                }
+              },
+              "expired": {
+                "summary": "Access token expired → client calls /auth/refresh and retries",
+                "value": {
+                  "error": {
+                    "code": "TOKEN_EXPIRED",
+                    "message": "Access token expired"
+                  }
+                }
+              },
+              "invalid": {
+                "value": {
+                  "error": {
+                    "code": "INVALID_TOKEN",
+                    "message": "Invalid access token"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "403 — authenticated, but the role may not do this",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "FORBIDDEN_ROLE",
+                "message": "Your role does not allow this action"
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "404 — does not exist, belongs to another tenant, or (for an AGENT) is not assigned to you. These cases are deliberately indistinguishable.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "NOT_FOUND",
+                "message": "Property not found"
+              }
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "422 — a business rule was violated",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "BUSINESS_RULE",
+                "message": "Some listings were not found; nothing was changed",
+                "details": {
+                  "missingIds": [
+                    999999
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "503 — a dependency is down",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Identity service is unavailable"
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "XRequestId": {
+        "name": "X-Request-Id",
+        "in": "header",
+        "required": false,
+        "description": "Optional correlation id (8–64 chars `[A-Za-z0-9._:-]`). Generated when absent and echoed back in the response header; appears on every log line.",
+        "schema": {
+          "type": "string",
+          "example": "web-7f3a9c21"
+        }
+      }
+    },
+    "headers": {
+      "X-Request-Id": {
+        "description": "Correlation id for this request (search logs with it)",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    }
+  },
+  "x-socket-io": {
+    "transport": "Socket.IO v4 on the crm-api origin (path /socket.io). Redis adapter fans events out across instances.",
+    "handshake": {
+      "auth": {
+        "token": "<access token>"
+      },
+      "onError": "connect_error with message UNAUTHENTICATED | TOKEN_EXPIRED | INVALID_TOKEN | FORBIDDEN_ROLE"
+    },
+    "ack": "Every client→server event takes an ack callback: { ok: true, ... } or { ok: false, error: { code, message, details? } }",
+    "clientToServer": {
+      "auth:renew": {
+        "payload": {
+          "token": "string"
+        },
+        "ack": {
+          "ok": true,
+          "exp": 1790000000
+        },
+        "note": "Swap in a fresh access token without reconnecting"
+      },
+      "property:join": {
+        "payload": {
+          "propertyId": 1699
+        },
+        "ack": {
+          "ok": true,
+          "room": "property:1699"
+        },
+        "note": "Refused with NOT_FOUND unless the user may read the property (tenant + agent ownership)"
+      },
+      "property:leave": {
+        "payload": {
+          "propertyId": 1699
+        }
+      },
+      "typing": {
+        "payload": {
+          "propertyId": 1699,
+          "isTyping": true
+        },
+        "note": "Relayed to the rest of the room"
+      },
+      "chat:send": {
+        "payload": {
+          "propertyId": 1699,
+          "clientMsgId": "c-01J9Z3K4",
+          "body": "Owner confirmed Saturday 11 AM"
+        },
+        "ack": {
+          "ok": true,
+          "id": 5521,
+          "createdAt": "2026-10-01T05:20:11.000Z",
+          "duplicate": false,
+          "message": "ChatMessage"
+        },
+        "note": "Persisted before broadcast; a retry with the same clientMsgId acks the original row with duplicate=true and is not re-broadcast. An expired token acks TOKEN_EXPIRED: renew, then retry with the same clientMsgId."
+      }
+    },
+    "serverToClient": {
+      "chat:new": {
+        "room": "property:{id}",
+        "payload": "ChatMessage"
+      },
+      "typing": {
+        "room": "property:{id}",
+        "payload": {
+          "propertyId": 1699,
+          "user": {
+            "id": 4,
+            "name": "Riya Sharma"
+          },
+          "isTyping": true
+        }
+      },
+      "presence": {
+        "room": "property:{id}",
+        "payload": {
+          "propertyId": 1699,
+          "users": [
+            {
+              "id": 4,
+              "name": "Riya Sharma"
+            }
+          ]
+        }
+      },
+      "note:new": {
+        "room": "property:{id}",
+        "payload": "Note"
+      },
+      "property:updated": {
+        "room": "tenant:{tid}:staff + user:{assigneeId} + property:{id}",
+        "payload": {
+          "tenantId": 1,
+          "ids": [
+            1699
+          ],
+          "action": "updated",
+          "version": 5
+        }
+      },
+      "masterdata:updated": {
+        "room": "tenant:{tid}",
+        "payload": {
+          "tenantId": 1,
+          "kind": "localities"
+        }
+      },
+      "visit:reminder": {
+        "room": "user:{agentId}",
+        "payload": {
+          "visitId": 77,
+          "propertyId": 1699,
+          "propertyTitle": "2 BHK Apartment for sale in Powai",
+          "building": "Hiranandani Gardens A Wing 1203",
+          "visitAt": "2026-10-01T04:30:00.000Z",
+          "minutesUntil": 15,
+          "visitorName": "Amit Joshi"
+        },
+        "note": "From the every-minute cron; exactly once per visit across instances"
+      },
+      "visit:created": {
+        "room": "user:{agentId}",
+        "payload": {
+          "id": 78,
+          "propertyId": 1699,
+          "visitAt": "2026-10-03T06:00:00.000Z"
+        }
+      }
+    }
+  }
+}

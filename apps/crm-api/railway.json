@@ -1,0 +1,12 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": { "builder": "DOCKERFILE", "dockerfilePath": "apps/crm-api/Dockerfile", "watchPatterns": ["apps/crm-api/**", "packages/shared/**", "package-lock.json"] },
+  "deploy": {
+    "preDeployCommand": ["node dist/src/scripts/migrate.js up"],
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 60,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5,
+    "drainingSeconds": 10
+  }
+}
